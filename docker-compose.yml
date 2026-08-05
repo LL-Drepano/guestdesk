@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16
+    container_name: guestdesk_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: guestdesk
+      POSTGRES_PASSWORD: guestdesk_local_pw
+      POSTGRES_DB: guestdesk
+    ports:
+      - "5433:5432"
+    volumes:
+      - guestdesk_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guestdesk -d guestdesk"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  guestdesk_pgdata:
