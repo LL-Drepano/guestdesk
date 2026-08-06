@@ -5,8 +5,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_session
+from app.ingest import router as ingest_router
 
 app = FastAPI(title="GuestDesk", version="0.1.0")
+app.include_router(ingest_router)
 
 
 @app.get("/health")
