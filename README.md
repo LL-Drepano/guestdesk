@@ -1,89 +1,53 @@
 # guestdesk
 
-A backend service that receives guest messages, queues them, and processes them
-concurrently in the background — with duplicate deliveries blocked at the database
-level, and a live cloud deployment. Built with FastAPI, PostgreSQL, and a
-Postgres-backed job queue; deployed on Render with managed Postgres on Neon.
+A backend service that receives guest messages, stores them, queues background work, and allows multiple workers to process the queue concurrently.
 
-> **In one sentence:** a guest message arrives at an API endpoint, gets validated and
-> stored exactly once, and a separate worker picks it up and processes it — with the
-> whole thing running live in the cloud.
+Duplicate message deliveries are rejected through PostgreSQL uniqueness constraints, while workers use row-level locking to avoid claiming the same pending job at the same time.
+
+Built with FastAPI, PostgreSQL, SQLAlchemy and Alembic, with a local Docker setup and a live cloud deployment on Render + Neon.
 
 ![Scenario canvas](images_guestdesk/worker1.png)
 ![Scenario canvas](images_guestdesk/worker2.png)
 
 ---
-## Highlights
-
-- **Handles each message exactly once, enforced by the database.** Duplicate deliveries
-  are blocked by two independent uniqueness rules in PostgreSQL, so a repeated message
-  physically can't be stored twice. The guarantee is built into the storage itself, which
-  means application code has no way to let a duplicate slip through even under heavy load.
-- **Processes the queue with multiple workers, collision-free.** Using PostgreSQL's
-  row-locking (`SKIP LOCKED`), two workers drain the same queue in parallel while each job
-  goes to exactly one of them — demonstrated live with two workers running side by side.
-- **Relational database design (SQL / PostgreSQL) doing real work.** Data modelled as
-  tables with enforced rules — uniqueness for deduplication, a constrained status for a
-  valid job lifecycle — so whole categories of bad data are refused at the point of
-  writing. Structure managed through versioned migrations that any environment can replay
-  to rebuild the schema identically.
-- **Deployed live in the cloud, and runnable locally.** Running on Render with managed
-  PostgreSQL on Neon, database migrations applied automatically on deploy, secrets kept in
-  the platform's settings, and auto-redeploy on every push.
-
-## What this is
-
-This is the **reliability spine** of a larger guest-operations system, built first and on
-purpose. The hard part of a service like this isn't the AI that eventually reads the
-messages; it's making the plumbing underneath correct: accepting work without blocking,
-handling each message exactly once, and letting more than one worker drain the queue
-without them colliding.
-
-I built this layer to completion and stopped there deliberately. The stages that sit on
-top of it (listed near the bottom) are designed but intentionally unbuilt. I wanted to
-prove I can build the part that has to stay correct under load, which is the part most
-portfolio projects skip. And plainly: this scope is also what I set out to demonstrate
-for my job search — real database design, a managed cloud deployment, and safe
-concurrent processing. Stopping at a complete, coherent foundation made more sense than
-half-building the entire system.
-
----
 
 ## The problem
 
-A service that processes incoming messages has three constraints that are easy to get
-wrong and painful to discover once it's live:
+A message-processing backend has a few problems that are easy to hide in a small demo.
 
-- **The response has to be fast.** The real work — eventually, reading a message with an
-  LLM — is slow. Running it inside the request means the caller waits seconds, the API
-  can only handle a few requests at a time, and a processing failure shows up as a failed
-  web request.
-- **The same message must be handled only once.** Message providers deliver
-  at-least-once, so duplicates are normal. Handling one twice means a guest gets replied
-  to, billed, or actioned twice.
-- **Processing has to survive scale and failure.** Multiple workers should be able to
-  drain the queue at once while still handling each job exactly once.
+The API should respond quickly even if the real work takes seconds. Message providers may deliver the same event more than once. And once multiple background workers are running, they must be able to consume the same queue without both claiming the same pending job.
 
-The service is built around these three constraints from the first line.
+The service separates those responsibilities:
+
+```text
+HTTP request
+→ validate message
+→ store message + create job
+→ return response
+
+                         ↓
+
+                 background worker
+                         ↓
+                    claim job
+                         ↓
+                   process job
+```
+
+PostgreSQL is used both as the persistent store and as the job queue.
 
 ---
 
-## What I built
+## Highlights
 
-A message-processing spine, in the standard producer/consumer shape:
+* **Database-level message deduplication.** `provider_message_id` and a SHA-256 content fingerprint are protected by independent PostgreSQL uniqueness constraints.
+* **Concurrent queue consumption.** Workers claim pending jobs with `SELECT ... FOR UPDATE SKIP LOCKED`, allowing multiple workers to poll the same table without claiming the same pending row.
+* **API and background processing are separate.** `POST /ingest` only validates and stores work; slow processing happens in a dedicated worker process.
+* **Versioned database schema.** Tables and constraints are managed through Alembic migrations rather than manually-created database state.
+* **Live cloud deployment.** The API runs on Render against managed PostgreSQL on Neon, while the same code can run locally against PostgreSQL 16 through Docker Compose.
+* **Dependency-aware health check.** `/health` returns `503` when PostgreSQL cannot be reached instead of reporting the application as healthy regardless of its database state.
 
-1. **Ingest** — a FastAPI endpoint receives a guest message as JSON, validates it, and
-   stores it exactly once, creating a job to process it.
-2. **Deduplicate** — repeated messages are blocked by the database itself, using two
-   independent fingerprints, before any processing happens.
-3. **Queue** — the job waits in a database table marked `pending`. The `jobs` table acts
-   as the queue; there's no separate queue service to run.
-4. **Process** — a separate worker program claims pending jobs one at a time, does the
-   work, and marks them `done`, staying safe even with several workers running together.
-
-**Stack:** FastAPI · PostgreSQL 16 · SQLAlchemy 2 · Alembic (database migrations) ·
-psycopg 3 · Docker Compose (local) · Render (app) + Neon (managed Postgres) for the live
-deployment.
+**Stack:** FastAPI · PostgreSQL 16 · SQLAlchemy 2 · Alembic · psycopg · Pydantic · Docker Compose · Render · Neon.
 
 ![The live API documentation page](images_guestdesk/API_docs.png)
 
@@ -91,150 +55,414 @@ deployment.
 
 ## How it works
 
-### 1. Ingest — validate at the door
+### 1. Message ingestion
 
-The entry point is a FastAPI `POST /ingest` endpoint. Incoming JSON is checked against a
-strict schema before anything reaches the database, so a malformed sender or an oversized
-body is turned away immediately with a clear error. This is the first of two safety
-layers: validation handles bad input politely at the door, and the database rules behind
-it are the final backstop.
+The entry point is:
 
-### 2. Deduplicate — the guarantee lives in the database
+```text
+POST /ingest
+```
 
-This is the core of the reliability story.
+Incoming JSON is validated with a Pydantic schema before it reaches the database.
 
-The tempting way to prevent duplicates is to look before storing: check whether the
-message already exists, and if it doesn't, insert it. That approach has a hidden flaw —
-two identical messages arriving at the same instant can both pass the check before either
-one is stored, and a duplicate slips through. The check and the store happen as two
-separate steps, so under load they can overlap.
+A message contains:
 
-Instead, the service just tries to store the message and lets the database enforce
-uniqueness. The `messages` table carries two independent uniqueness rules — one on an ID
-supplied by the message provider, one on a fingerprint computed from the message's own
-content. When a repeat arrives, the database refuses it, and the endpoint catches that
-refusal and responds calmly with "already received." Because the database enforces this
-at the moment of writing, two simultaneous attempts end with one stored and the other
-turned away. The guarantee is built into the storage itself, so no bug in the application
-code can let a duplicate through.
+* sender;
+* optional subject;
+* body;
+* optional provider message ID.
 
-> Two fingerprints, both on purpose: the provider's ID catches the common case, where the
-> provider redelivers the same message. The content fingerprint catches the sneakier one,
-> where the same message arrives wearing a different ID — a resend or a forward. A repeat
-> is blocked if it matches on either.
+The body must be non-empty and is limited to 50,000 characters. Sender validation uses an email field rather than accepting an arbitrary string.
+
+For every accepted message, the ingest endpoint creates:
+
+1. a `Message`;
+2. an initial `Job` with status `pending`.
+
+Both are committed together in the same database transaction.
+
+The API can therefore accept work without performing the slow background operation during the HTTP request.
+
+### 2. Duplicate detection
+
+The service does not use the pattern:
+
+```text
+SELECT message
+→ if it does not exist
+→ INSERT message
+```
+
+because two concurrent requests can both perform the check before either insert commits.
+
+Instead, duplicate detection is enforced when PostgreSQL writes the row.
+
+The `messages` table has two uniqueness constraints:
+
+```text
+provider_message_id
+content_hash
+```
+
+The provider ID handles the normal redelivery case when the upstream system sends the same message more than once with the same identifier.
+
+The secondary fingerprint is calculated from:
+
+```text
+sender | subject | body
+```
+
+using SHA-256.
+
+If either uniqueness constraint rejects the insert, the transaction is rolled back and the endpoint returns:
+
+```json
+{
+  "detail": "duplicate message, already received"
+}
+```
+
+This means concurrent inserts cannot both create the same message row merely because they reached the application at the same time.
 
 ![The database refusing a duplicate](images_guestdesk/duplicateresponse.png)
 
-### 3. Queue — the database is the queue
+### 3. PostgreSQL as the job queue
 
-The job waits in the `jobs` table with a status that the database restricts to a fixed
-set of allowed values (`pending`, `processing`, `done`, `failed`, `dead`) — an illegal
-status physically can't be written. There's no Redis or RabbitMQ here; PostgreSQL handles
-this comfortably at this scale, which means one fewer service to run, pay for, and deploy.
-A dedicated queue becomes worth it at high throughput or when you need features Postgres
-lacks — at this scale it would be the wrong complexity.
+Jobs are stored in a normal PostgreSQL table.
 
-### 4. Process — a separate worker, and safe concurrency
+The current job states allowed by the database are:
 
-The worker is a **separate program** from the API, which is the whole reason the API can
-answer in milliseconds while the real work takes seconds. Its life is a loop: claim a
-pending job, mark it `processing`, do the work, mark it `done`.
+```text
+pending
+processing
+done
+failed
+dead
+```
 
-The claim is where the interesting problem is. Run two workers at once to go faster, and
-both poll the same table, both can see the same pending job, and both try to grab it — so
-a guest gets processed twice. It's the same shape as the duplicate-message problem, one
-level up.
+A `CHECK` constraint rejects any other status.
 
-The fix follows the same philosophy: let the database enforce it. The worker claims a job
-using PostgreSQL's `SELECT ... FOR UPDATE SKIP LOCKED` — it finds a pending job and locks
-that row so no other worker can take it, and any other worker looking at the same instant
-simply skips the locked row and grabs a different job. The lock is held only for the
-brief moment of claiming, not while the slow work runs, so one worker's job never holds
-up another's.
+Each job references its source message through a foreign key.
 
-I proved this by running two workers at once against the same queue. They split the jobs
-between them cleanly — every job claimed by exactly one worker, and no job ever appearing
-in both — which is the screenshot at the top of this README.
+The relationship is intentionally one-to-many:
 
-> **On the current build:** the "work" itself is a placeholder (a short pause) standing in
-> for the LLM classification and drafting that Stage 2 adds. The concurrency, queueing,
-> and deduplication are real and complete; the intelligence on top is designed and not
-> yet built (see below).
+```text
+Message
+   │
+   ├── Job
+   ├── Job
+   └── ...
+```
+
+The current ingest flow creates one initial processing job, but the data model does not require one job per message forever. A later version could attach separate classification, drafting, notification, or other jobs to the same stored message.
+
+At the current scale, PostgreSQL is also enough for the queue itself, so the demo does not require Redis, RabbitMQ or another service.
+
+### 4. Concurrent job claiming
+
+The worker runs separately from the API and continuously looks for the oldest pending job.
+
+The claim query uses:
+
+```sql
+SELECT ...
+FROM jobs
+WHERE status = 'pending'
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+```
+
+When one worker selects a row, PostgreSQL locks it during the claim transaction.
+
+Another worker polling at the same moment does not wait for that row. `SKIP LOCKED` makes it move past the locked job and look for another pending one.
+
+The selected job is changed to:
+
+```text
+processing
+```
+
+and committed.
+
+The worker then performs the job and eventually writes:
+
+```text
+done
+```
+
+The two screenshots at the top come from running two workers against the same queue and observing them claim different jobs.
+
+The current `process_job()` implementation uses a short sleep as the placeholder for the slow operation. LLM classification and response drafting are not implemented in this repository yet.
+
+---
+
+## Database model
+
+The core schema is intentionally small.
+
+### `messages`
+
+Stores the received message and its deduplication identifiers.
+
+Relevant rules:
+
+```text
+PRIMARY KEY         id
+UNIQUE              provider_message_id
+UNIQUE              content_hash
+```
+
+### `jobs`
+
+Stores work associated with a message.
+
+Relevant fields include:
+
+```text
+id
+message_id
+status
+attempts
+created_at
+updated_at
+```
+
+and:
+
+```text
+FOREIGN KEY message_id → messages.id
+```
+
+The database also restricts `status` to the known lifecycle values.
+
+Schema changes are tracked through Alembic migrations so the same structure can be recreated locally or in another environment.
 
 ---
 
 ## Live deployment
 
-The service runs live, not only on my laptop:
+The API is deployed on Render with PostgreSQL hosted on Neon.
 
-- **App on Render** (free tier), with **managed Postgres on Neon** (permanent free tier),
-  chosen over Render's own database because Neon's free database doesn't expire.
-- **Migrations run on deploy** — the database structure is created in the cloud
-  automatically by the start command, so the deployed schema matches local exactly.
-- **Secrets stay out of the code** — the database address lives in the platform's
-  settings, never in the repository. Deploying took zero code changes, because the app
-  reads its configuration from the environment; the code running in the cloud is
-  identical to the code running locally.
-- **Auto-redeploys on every push** to `main`, a small slice of continuous deployment.
+Configuration is read from environment variables, so the database URL is not stored in the repository.
 
-The `/health` endpoint returns a 503 error (rather than a 200 success) when the database
-is unreachable, so the hosting platform can tell the difference between "the app is
-running" and "the app can actually do its job." A health check that always returned
-success would report everything as fine straight through an outage.
+The same application code can therefore point to:
 
----
+```text
+local PostgreSQL
+```
 
-## Design decisions
+or:
 
-- **Duplicate-safety enforced by the database.** Two uniqueness rules in the database
-  instead of a check in the application code, because the database enforces it at the
-  moment of writing and can't be tricked by two requests arriving at once.
-- **`SKIP LOCKED` for the worker claim.** Two workers can't grab the same job, because the
-  database hands the locked row to exactly one of them. The correctness guarantee lives in
-  the layer that can't be raced.
-- **Postgres as the queue.** One fewer moving part than a dedicated queue service, and the
-  right call at this scale, with a clear line for when I'd change it.
-- **Worker as a separate program.** Keeps fast acceptance and slow work apart, and it's
-  ready to deploy as its own service with no code change.
-- **Fail fast on a dead dependency.** An explicit connection timeout on the database, so
-  an outage surfaces in seconds instead of hanging a worker indefinitely and dragging the
-  whole system down with it.
-- **Migrations instead of hand-edited structure.** Every change to the database is a
-  versioned, reversible migration checked into Git, so any copy — local, CI, or cloud —
-  is rebuilt identically.
+```text
+managed cloud PostgreSQL
+```
 
----
+without changing the Python source.
 
-## Designed but not built (deliberately)
+Database migrations are applied during deployment, and pushes to the deployment branch trigger a new application deployment.
 
-This repository is the reliability foundation. The full guest-operations system sits on
-top of it, and these stages are designed and intentionally unbuilt — the load-bearing
-part came first:
+The application also exposes:
 
-- **Intelligence:** LLM classification of each message (intent, urgency) with structured
-  output, and a drafted reply grounded in real property documents using **RAG** —
-  retrieval based on meaning rather than keyword matching.
-- **Reliability hardening:** automatic retries with backoff and a dead-letter path for
-  jobs that exhaust them, plus recovery of jobs left stranded by a killed worker.
-- **Verification:** an automated test suite run against a throwaway database, and a small
-  evaluation set that measures classification quality, both run in CI.
+```text
+GET /health
+```
 
-I stopped at a complete, coherent spine rather than half-build the whole system.
+which performs a real database query.
+
+When PostgreSQL is reachable:
+
+```json
+{
+  "status": "ok",
+  "database": "ok"
+}
+```
+
+When it is not reachable, the endpoint returns HTTP `503` and reports the application as degraded.
 
 ---
 
-## Key techniques
+## Current failure behaviour
 
-- Building a producer/consumer message-processing service, where the API accepts requests
-  quickly and a separate worker handles the slow work in the background.
-- **Relational database design (SQL / PostgreSQL):** modelling the data as tables with
-  enforced rules — uniqueness constraints that make duplicate messages impossible, and a
-  constraint that limits each job to a fixed set of valid states — so that whole
-  categories of bad data can't be stored in the first place.
-- **Safe concurrency:** using PostgreSQL's row-locking (`SELECT ... FOR UPDATE SKIP
-  LOCKED`) so multiple workers can drain one queue at the same time without ever handling
-  the same job twice — demonstrated with two workers running in parallel.
-- **A real cloud deployment:** a containerized local setup, managed cloud PostgreSQL,
-  database migrations that run automatically on deploy, configuration and secrets kept
-  out of the code, and health checks that report the true state of the service's
-  dependencies.
+The current worker implements the basic lifecycle:
+
+```text
+pending
+→ processing
+→ done
+```
+
+If an exception happens inside the worker loop, the exception is logged and the current SQLAlchemy session is rolled back.
+
+There is an important limitation here.
+
+The transition to `processing` is committed before the slow work starts. If a worker dies after that commit but before the job reaches `done`, the current implementation does not automatically recover the stranded job.
+
+The schema already includes:
+
+```text
+attempts
+failed
+dead
+```
+
+but retry policies and recovery logic are not wired into the worker yet.
+
+So the current concurrency guarantee is specifically about **exclusive claiming of pending jobs**, not an exactly-once guarantee across arbitrary process crashes and retries.
+
+---
+
+## Limitations and possible improvements
+
+### Worker recovery and retries
+
+There is currently no reaper for jobs left in `processing` by a killed worker.
+
+A later version could add:
+
+* processing leases or timestamps;
+* automatic retry with backoff;
+* attempt counting;
+* recovery of stale `processing` jobs;
+* transition to `dead` after the retry budget is exhausted.
+
+This would also require making downstream side effects idempotent if jobs can be retried.
+
+### Content fingerprint scope
+
+The secondary deduplication fingerprint uses:
+
+```text
+sender + subject + body
+```
+
+and its uniqueness is global.
+
+That is useful for catching the same payload arriving with a different provider ID, but it also means two legitimate messages containing exactly the same values at different times would currently be treated as duplicates.
+
+A production version could scope content-based deduplication to a time window or adapt the rule to the delivery semantics of the actual provider.
+
+### Integrity error classification
+
+The current ingest endpoint catches SQLAlchemy `IntegrityError` and treats it as a duplicate response.
+
+That is sufficient for the current small schema and was left simple intentionally, but it does not inspect which database constraint actually failed.
+
+A more defensive version would distinguish the known PostgreSQL uniqueness violations from unrelated integrity errors and surface unexpected failures separately.
+
+### Authentication
+
+`POST /ingest` is not currently protected by authentication.
+
+For a real external integration, the endpoint could require an API key, signed webhook request, or provider-specific authentication before accepting messages.
+
+### Queue scaling
+
+PostgreSQL is enough for the current workload and keeps the number of services small.
+
+At substantially higher throughput, queue access patterns could be indexed more specifically and eventually moved to a dedicated queue system if requirements such as scheduling, priorities, high fan-out, or more advanced retry semantics justified it.
+
+### Automated tests
+
+The repository does not currently include the integration test suite I would want before extending the worker lifecycle.
+
+Useful cases would include:
+
+* simultaneous duplicate ingest requests;
+* duplicate content with different provider IDs;
+* multiple workers draining the same queue;
+* database failure during `/health`;
+* worker crashes and stale-job recovery once that behaviour exists.
+
+### Message processing
+
+The actual message intelligence is intentionally outside the current scope.
+
+Possible later stages include:
+
+* intent classification;
+* urgency detection;
+* structured extraction;
+* response drafting;
+* retrieval from property documents;
+* human-review workflows.
+
+---
+
+## Running the project
+
+### Prerequisites
+
+* Python;
+* Docker;
+* Docker Compose.
+
+Start the local PostgreSQL database:
+
+```bash
+docker compose up -d
+```
+
+Create the environment file from the supplied example:
+
+```bash
+cp .env.example .env
+```
+
+The local database configuration uses PostgreSQL exposed on port `5433`.
+
+Install the Python dependencies:
+
+```bash
+python -m venv .venv
+pip install -r requirements.txt
+```
+
+Apply the database migrations:
+
+```bash
+alembic upgrade head
+```
+
+Start the FastAPI application:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+The interactive API documentation is then available through FastAPI's `/docs` route.
+
+Run a background worker in a separate terminal:
+
+```bash
+python -m app.worker
+```
+
+To test concurrent claiming, start the same worker command in a second terminal.
+
+---
+
+## Repository structure
+
+```text
+guestdesk/
+├── alembic/
+│   └── versions/
+├── app/
+│   ├── config.py
+│   ├── db.py
+│   ├── ingest.py
+│   ├── main.py
+│   ├── models.py
+│   ├── schemas.py
+│   └── worker.py
+├── images_guestdesk/
+├── .env.example
+├── alembic.ini
+├── docker-compose.yml
+├── requirements.txt
+└── README.md
+```
+
+Configuration values and database credentials are supplied through environment variables rather than committed into the application code.
